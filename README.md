@@ -13,7 +13,7 @@ The environment simulates a battlefield scenario where autonomous agents must ev
 
 ### **1. Clone the Repository**  
 ```bash
-git clone [https://gitlab.com/your-username/tewa-rl.git](https://github.com/GozdeKorpe/TEWARL.git)
+git clone https://github.com/GozdeKorpe/TEWARL.git
 cd tewa-rl
 ```
 
