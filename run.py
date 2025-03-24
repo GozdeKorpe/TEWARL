@@ -6,11 +6,11 @@ from TEWAenv import TEWAEnv  # Import your environment
 from gymnasium.spaces import Box
 
 # ✅ Load the trained model
-model = PPO.load("tewa_ppoLSTM_model")
+model = PPO.load("tewa_ppoLSTM4.1_model")
 print("✅ Loaded Trained Model!")
 
 # ✅ Create the same environment
-env = TEWAEnv(num_threats=7, num_weapons=2, battlefield_size=150, missiles_per_weapon=3, max_assignments=1)
+env = TEWAEnv(num_threats=4, num_weapons=1, battlefield_size=150, missiles_per_weapon=3, max_assignments=1)
 
 
 # **6️⃣ Run the Trained Model on the Environment**
@@ -24,5 +24,5 @@ for _ in range(50):
     obs, reward, done, _, _ = env.step(action)
     env.render(action)  # Visualize the assignments
     if done:
-        print("\n🎉 All threats have been eliminated! Simulation complete.")
+        print("\n Simulation complete.")
         break
