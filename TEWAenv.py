@@ -97,8 +97,8 @@ class TEWAEnv(gym.Env):
 
             # **Final danger score: Weighted sum of all factors**
             danger_score = (
-                (severity_score * 0.4) +  # Severity is most important
-                (distance_score * 0.3) +  # Distance to base is crucial
+                (severity_score * 0.3) +  # Severity is most important
+                (distance_score * 0.4) +  # Distance to base is crucial
                 #(heading_score * 0.2) +   # Heading toward base adds risk
                 (speed_score * 0.2)       # Faster threats are slightly more dangerous
             )
@@ -208,7 +208,7 @@ class TEWAEnv(gym.Env):
 
         # **Apply a Penalty if a Threat Gets Too Close to a Weapon**
         danger_zone = 10  # Define how close is "too close"
-        close_threat_penalty = -10  # Penalty value
+        close_threat_penalty = -2  # Penalty value
 
         for threat_idx in range(self.num_threats):
             threat_x, threat_y, _, _, = self.threats[threat_idx]
@@ -337,7 +337,7 @@ class TEWAEnv(gym.Env):
        
 
         plt.title(f"Battlefield at Step {self.steps}")
-        plt.pause(0.6)
+        plt.pause(1.5)
         # Print the assignment pairs for each step
         print("\n🔗 **Assignment Pairs (Weapon → Threat)** 🔗")
         for weapon_idx, threat_idx in self.tracked_assignments:
