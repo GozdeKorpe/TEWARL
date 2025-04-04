@@ -13,6 +13,8 @@ import os
 from stable_baselines3.common.monitor import Monitor
 from sb3_contrib import RecurrentPPO 
 from tqdm import tqdm 
+from stable_baselines3.common.utils import get_linear_fn
+
 
 log_dir = "./a2c_tewa_tensorboard/"
 os.makedirs(log_dir, exist_ok=True)
@@ -25,10 +27,11 @@ env_v = Monitor(env, log_dir)
 vec_env = make_vec_env(lambda: env_v, n_envs=1)
 
 # **2️⃣ Initialize the RL Model (Using PPO)**
-model = A2C("MlpPolicy", vec_env, verbose=1, tensorboard_log="./tewa_tensorboard/")
+
+model = A2C("MlpPolicy", vec_env, verbose=1, tensorboard_log="./tewa_tensorboard/", ent_coef=0.05,gamma=0.98)
 
 # **3️⃣ Train the Model**
-TIMESTEPS = 45000  
+TIMESTEPS = 30000  
 model.learn(total_timesteps=TIMESTEPS)
 
 plot_results(["a2c_tewa_tensorboard/"], x_axis='timesteps', num_timesteps=TIMESTEPS, task_name="PPO TEWA")
@@ -38,7 +41,7 @@ plt.show()
 
 
 # **4️⃣ Save the Trained Model**
-model.save("tewa_a2c6.2_model")
+model.save("tewa_a2c6.2.new_model")
 print("✅ Model saved!")
 
 # **5️⃣ Evaluate the Model**

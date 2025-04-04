@@ -1,12 +1,12 @@
 import gymnasium as gym
 import numpy as np
 import torch
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, A2C
 from TEWAenv import TEWAEnv  # Import your environment
 from gymnasium.spaces import Box
 
 # ✅ Load the trained model
-model = PPO.load("tewa_a2c6.2_model")
+model = A2C.load("tewa_a2c6.2_model")
 print("✅ Loaded Trained Model!")
 
 # ✅ Create the same environment

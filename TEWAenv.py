@@ -21,7 +21,7 @@ class TEWAEnv(gym.Env):
         self.total_missiles = self.num_weapons * self.missiles_per_weapon
         # Observation space: [Threat positions, speeds,  severity, missile availability]
         self.observation_space = spaces.Box(
-            low=0, high=battlefield_size, shape=(num_threats * 4 + num_weapons*missiles_per_weapon,), dtype=np.float32
+            low=0, high=battlefield_size, shape=(num_threats * 4 + num_weapons*3,), dtype=np.float32
         )
         
 
@@ -115,9 +115,10 @@ class TEWAEnv(gym.Env):
 
     def step(self, action):
         """
-        Executes an action, eliminates threats after being assigned to the SAME weapon for 7+ seconds.
+        Executes an action, eliminates threats after being assigned to the SAME weapon for 3+ seconds.
         Includes a stability reward to encourage consistent assignments.
         """
+        print("\n🟡 Raw action input:", action)
         self.steps += 1
         reward = 0
         done = False
@@ -126,6 +127,7 @@ class TEWAEnv(gym.Env):
         threat_evaluation = self.evaluate_threats()
         threat_ranking = {threat[0]: rank for rank, threat in enumerate(threat_evaluation)}
         step_missile_usage = {i: 0 for i in range(self.num_weapons)}
+        valid_threats = np.ones(self.num_threats, dtype=bool)
         
 
         # Convert action into a (num_weapons × missiles_per_weapon) matrix
@@ -146,31 +148,54 @@ class TEWAEnv(gym.Env):
         print(f"[DEBUG] Active Threats at Step {self.steps}: {list(range(self.num_threats))}")
         
         # **Process missile assignments while respecting `max_assignments_per_threat`**
-        for weapon_idx in range(self.num_weapons):
-            for missile_idx in range(self.missiles_per_weapon):
-                if step_missile_usage[weapon_idx] < self.weapons[weapon_idx, 2]:  # Check if weapon has missiles left
-                    threat_idx = action[weapon_idx, missile_idx]
+        for threat_idx in range(self.num_threats):
+    # If this threat is not yet assigned and is still valid and can be assigned
+            print(valid_threats)
+            if threat_idx not in assigned_this_step and valid_threats[threat_idx] and threat_assignments[threat_idx] < self.max_assignments:
+                for weapon_idx in range(self.num_weapons):
+                    for missile_idx in range(self.missiles_per_weapon):
+                        if step_missile_usage[weapon_idx] < int(self.weapons[weapon_idx, 2]):  # Check if weapon has missiles left
+                            threat_idx = action[weapon_idx, missile_idx]
+                            if 0 <= threat_idx < self.num_threats:
+                                print(f"Trying: Weapon {weapon_idx}, Missile {missile_idx} → Threat {threat_idx}, Validity: {valid_threats[threat_idx]}")
+                            else:
+                                print(f"🚨 Invalid threat index {threat_idx} (num_threats={self.num_threats}) - skipped.")
+                            if 0 <= threat_idx < self.num_threats and threat_assignments[threat_idx] < self.max_assignments and  valid_threats[threat_idx]:
+                                assigned_this_step[threat_idx] = weapon_idx  # Store current assignment
+                                self.tracked_assignments.append((weapon_idx, threat_idx))
+                                threat_assignments[threat_idx] += 1  # Track assignments
+                                # Decrease missile count for the assigned weapon
+                                step_missile_usage[weapon_idx] += 1
+                                if threat_assignments[threat_idx] >= self.max_assignments:
+                                    valid_threats[threat_idx] = False
+                                reward += 2
+                                # **Reward Based on Threat Priority**
+                                danger_rank = threat_ranking.get(threat_idx, len(threat_evaluation))  # Get threat rank
+                                max_rank = len(threat_evaluation)
 
-                    if 0 <= threat_idx < self.num_threats and threat_assignments[threat_idx] < self.max_assignments:
-                        assigned_this_step[threat_idx] = weapon_idx  # Store current assignment
-                        self.tracked_assignments.append((weapon_idx, threat_idx))
-                        threat_assignments[threat_idx] += 1  # Track assignments
-                        reward += 2
-                        # Decrease missile count for the assigned weapon
-                        step_missile_usage[weapon_idx] += 1
-                         # **Reward Based on Threat Priority**
-                        danger_rank = threat_ranking.get(threat_idx, len(threat_evaluation))  # Get threat rank
-                        max_rank = len(threat_evaluation)
+                                # Assign higher reward for targeting **high-risk threats** (low rank)
+                                reward += (max_rank - danger_rank) * 5 
 
-                        # Assign higher reward for targeting **high-risk threats** (low rank)
-                        reward += (max_rank - danger_rank) * 4 
-
-                        # **Only increase duration if the same weapon is targeting the same threat**
-                        if threat_idx in self.previous_weapon_assignment and self.previous_weapon_assignment[threat_idx] == weapon_idx:
-                            self.weapon_assignment_duration[(weapon_idx, threat_idx)] = self.weapon_assignment_duration.get((weapon_idx, threat_idx), 0) + 1
-                        else:
-                            self.weapon_assignment_duration[(weapon_idx, threat_idx)] = 1  # Reset if new assignment
+                                # **Only increase duration if the same weapon is targeting the same threat**
+                                if threat_idx in self.previous_weapon_assignment and self.previous_weapon_assignment[threat_idx] == weapon_idx:
+                                    self.weapon_assignment_duration[(weapon_idx, threat_idx)] = self.weapon_assignment_duration.get((weapon_idx, threat_idx), 0) + 1
+                                else:
+                                    self.weapon_assignment_duration[(weapon_idx, threat_idx)] = 1  # Reset if new assignment
+                                print(f"Assigning: Weapon {weapon_idx}, Missile {missile_idx} → Threat {threat_idx}")
         
+        # ✅ **Insert the forced assignment logic here**
+        unassigned_threats = [i for i in range(self.num_threats) if valid_threats[i]]
+        for threat_idx in unassigned_threats:
+            for weapon_idx in range(self.num_weapons):
+                if step_missile_usage[weapon_idx] < int(self.weapons[weapon_idx, 2]):
+                    assigned_this_step[threat_idx] = weapon_idx
+                    self.tracked_assignments.append((weapon_idx, threat_idx))
+                    step_missile_usage[weapon_idx] += 1
+                    valid_threats[threat_idx] = False
+                    reward -= 5  # Additional reward adjustment here
+                    print(f"🚨 Forced assignment: Weapon {weapon_idx} → Threat {threat_idx}")
+                    break  # Move to next unassigned threat
+                
         for threat_idx in range(self.num_threats): #check for unassigned threats and give penality according to their rank
             could_be_assigned = sum(self.weapons[:, 2]) > 0 and threat_assignments[threat_idx] < self.max_assignments
             if threat_idx not in assigned_this_step and threat_idx in threat_ranking and could_be_assigned:
@@ -187,11 +212,11 @@ class TEWAEnv(gym.Env):
             print(f"    🔸 Available missiles: {total_available_missiles}")
             print(f"    🔸 Threats assignable: {available_threats}")
             print(f"    🔸 Assignments made:  {total_assignments}")
-            reward -= 2  # Optional: penalize for not assigning when able
+            reward -= 5  # Optional: penalize for not assigning when able
 
         # Optional: bonus reward for using missiles effectively
         if total_assignments == min(self.max_assignments * self.num_threats, total_available_missiles):
-            reward += 2  # Encourage full usage
+            reward += 5  # Encourage full usage
 
         # **Calculate Stability Reward**
         if self.previous_weapon_assignment:
@@ -240,9 +265,14 @@ class TEWAEnv(gym.Env):
 
         if threats_to_remove:
             threats_to_remove = [tid for tid in threats_to_remove if tid < len(self.threats)]  # Ensure valid indices
+            for tid in threats_to_remove:
+                for threat_info in threat_evaluation:
+                    if threat_info[0] == tid:
+                        danger_score = threat_info[1]
+                        reward += danger_score * 0.5  # Adjust multiplier as needed
+                        break
             self.threats = np.delete(self.threats, threats_to_remove, axis=0)  # Remove threats
             self.num_threats = len(self.threats)
-            reward += len(threats_to_remove) * 10  # Reward for eliminating threats
             for weapon_idx, threat_idx in self.tracked_assignments:
                 if threat_idx in threats_to_remove:
                     self.weapons[weapon_idx, 2] = max(0, self.weapons[weapon_idx, 2] - 1)
