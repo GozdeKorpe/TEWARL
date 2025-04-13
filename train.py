@@ -16,11 +16,11 @@ from tqdm import tqdm
 from stable_baselines3.common.utils import get_linear_fn
 
 
-log_dir = "./a2c_tewa_tensorboard/"
+log_dir = "./a2c_tewa_tensorboard_2/"
 os.makedirs(log_dir, exist_ok=True)
 
 # ✅ Wrap environment with Monitor to log rewards
-env = TEWAEnv(num_threats=6, num_weapons=2, battlefield_size=150, missiles_per_weapon=3, max_assignments=1)
+env = TEWAEnv(num_threats=60, num_weapons=5, battlefield_size=350, missiles_per_weapon=6, max_assignments=1)
 env_v = Monitor(env, log_dir)
 
 # Wrap the environment for parallel training (optional, but helps with stability)
@@ -31,7 +31,7 @@ vec_env = make_vec_env(lambda: env_v, n_envs=1)
 model = A2C("MlpPolicy", vec_env, verbose=1, tensorboard_log="./tewa_tensorboard/", ent_coef=0.05,gamma=0.98)
 
 # **3️⃣ Train the Model**
-TIMESTEPS = 30000  
+TIMESTEPS = 40000  
 model.learn(total_timesteps=TIMESTEPS)
 
 plot_results(["a2c_tewa_tensorboard/"], x_axis='timesteps', num_timesteps=TIMESTEPS, task_name="PPO TEWA")
@@ -41,7 +41,7 @@ plt.show()
 
 
 # **4️⃣ Save the Trained Model**
-model.save("tewa_a2c6.2.new_model")
+model.save("tewa_a2c60.5.6")
 print("✅ Model saved!")
 
 # **5️⃣ Evaluate the Model**
