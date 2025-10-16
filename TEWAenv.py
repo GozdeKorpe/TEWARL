@@ -2,303 +2,389 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import matplotlib.pyplot as plt
+import math
 
+# ---------------------------
+# Helper: SimpleThreat kinematics (with path history)
+# ---------------------------
+class SimpleThreat:
+    """Threat with simple kinematic motion toward an assigned weapon (limited turn rate).
+       Records path history in self.path (list of (x,y) tuples)."""
+    def __init__(self, pos, speed, heading_deg, target_weapon_idx, max_turn_deg=30.0, severity=None):
+        self.pos = np.array(pos, dtype=float)
+        self.speed = float(speed)
+        self.heading = float(heading_deg)  # degrees
+        self.target_weapon_idx = int(target_weapon_idx)
+        self.max_turn_deg = float(max_turn_deg)
+        self.severity = severity if severity is not None else np.random.uniform(0.5, 1.0)
+        # Path history for visualization
+        self.path = [tuple(self.pos.copy())]
+
+    def step_towards(self, goal_pos, dt=1.0):
+        dx, dy = goal_pos[0] - self.pos[0], goal_pos[1] - self.pos[1]
+        desired_rad = math.atan2(dy, dx)
+        desired_deg = math.degrees(desired_rad)
+        diff = ((desired_deg - self.heading + 180) % 360) - 180
+        max_turn = self.max_turn_deg * dt
+        turn = np.clip(diff, -max_turn, max_turn)
+        self.heading = (self.heading + turn) % 360
+        heading_rad = math.radians(self.heading)
+        vx = math.cos(heading_rad) * self.speed * dt
+        vy = math.sin(heading_rad) * self.speed * dt
+        self.pos += np.array([vx, vy])
+        # append new position to path history
+        self.path.append((self.pos[0], self.pos[1]))
+
+    def distance_to(self, goal_pos):
+        return np.linalg.norm(self.pos - np.array(goal_pos, dtype=float))
+
+
+# ---------------------------
+# Helper: allocate threats by asset values
+# ---------------------------
+def allocate_targets_by_asset_values(asset_values, num_threats):
+    assets = np.array(asset_values, dtype=float)
+    if assets.size == 0:
+        raise ValueError("asset_values must be non-empty")
+    if assets.sum() <= 0:
+        proportions = np.ones_like(assets) / len(assets)
+    else:
+        proportions = assets / assets.sum()
+    base_counts = np.floor(proportions * num_threats).astype(int)
+    remainder = int(num_threats - base_counts.sum())
+    order = np.argsort(-assets)  # descending asset indices
+    i = 0
+    while remainder > 0:
+        base_counts[order[i % len(order)]] += 1
+        remainder -= 1
+        i += 1
+    assignment_list = []
+    for w_idx, count in enumerate(base_counts):
+        assignment_list += [w_idx] * int(count)
+    if len(assignment_list) != num_threats:
+        if len(assignment_list) > num_threats:
+            assignment_list = assignment_list[:num_threats]
+        else:
+            assignment_list += [int(order[0])] * (num_threats - len(assignment_list))
+    return base_counts.tolist(), assignment_list
+
+
+# ---------------------------
+# TEWAEnv (randomized asset at reset + path visualization + debug prints restored)
+# ---------------------------
 class TEWAEnv(gym.Env):
-    """
-    TEWA Environment with Threat Evaluation, Multiple Missile Assignments, and Assignment Stability.
-    """
+    metadata = {"render.modes": ["human"]}
 
     def __init__(self, num_threats, num_weapons, battlefield_size, missiles_per_weapon, max_assignments):
         super(TEWAEnv, self).__init__()
 
-        self.num_threats = num_threats
+        self.max_threats = num_threats
         self.num_weapons = num_weapons
         self.missiles_per_weapon = missiles_per_weapon
         self.battlefield_size = battlefield_size
-        self.max_assignments = max_assignments  # Maximum number of missiles per threat
-        self.previous_action = None  
-        self.max_threats = num_threats  # Original number of threats
+        self.max_assignments = max_assignments
+        self.previous_action = None
         self.total_missiles = self.num_weapons * self.missiles_per_weapon
-        # Observation space: [Threat positions, speeds,  severity, missile availability]
-        self.observation_space = spaces.Box(
-            low=0, high=battlefield_size, shape=(num_threats * 4 + num_weapons*3,), dtype=np.float32
-        )
-        
 
-        # Action space: Each weapon selects multiple threats (up to available missiles)
-        self.action_space = spaces.MultiDiscrete([num_threats for _ in range(num_weapons * missiles_per_weapon)])
-        # Initialize tracking dictionary (threat ID → assigned time steps)
-        self.assignment_duration = {i: 0 for i in range(num_threats)}
+        # Observation: pad to max_threats
+        self.observation_space = spaces.Box(
+            low=0, high=float(battlefield_size),
+            shape=(self.max_threats * 4 + self.num_weapons * 3,),
+            dtype=np.float32
+        )
+        self.action_space = spaces.MultiDiscrete([self.max_threats for _ in range(self.num_weapons * self.missiles_per_weapon)])
+
+        # internal containers
+        self.assignment_duration = {i: 0 for i in range(self.max_threats)}
+        self.simple_threat_objs = []  # list[SimpleThreat]
+        self.weapon_asset_values = np.ones(self.num_weapons, dtype=float)
 
         self.reset()
 
     def reset(self, seed=None, options=None):
-        """
-        Resets the environment with random threats and missile status.
-        """
         np.random.seed(seed)
-        # ✅ Restore num_threats to its original value
-        self.num_threats = self.max_threats  # Ensure threats are reinitialized correctly
 
-        # Initialize threats: [X, Y, Speed, Orientation, Severity]
-        self.threats = np.column_stack((
-            np.random.uniform(10, self.battlefield_size - 10, self.num_threats),  
-            np.random.uniform(10, self.battlefield_size - 10, self.num_threats),  
-            np.random.uniform(1, 5, self.num_threats),  
-            #np.random.uniform(0, 360, self.num_threats),  
-            np.random.uniform(0.5, 1, self.num_threats)  
-        ))
-
-        # Initialize weapons at separate positions
+        # Initialize weapons (unchanged)
         weapon_x_positions = np.linspace(10, self.battlefield_size - 10, self.num_weapons)
         weapon_y_positions = np.full(self.num_weapons, self.battlefield_size / 2)
-
         self.weapons = np.column_stack((
-            weapon_x_positions,  
-            weapon_y_positions,  
-            np.full(self.num_weapons, self.missiles_per_weapon)  
+            weapon_x_positions,
+            weapon_y_positions,
+            np.full(self.num_weapons, self.missiles_per_weapon)
         ))
 
+        # Randomize assets once per episode
+        self.weapon_asset_values = np.random.randint(1, 6, size=self.num_weapons).astype(float)
+        print(f"🎯 Random weapon_asset_values at reset: {self.weapon_asset_values.tolist()}")
+
+        # Initialize threats allocated by assets
+        self._init_simple_red_team(self.max_threats)
+
         self.steps = 0
-        self.previous_action = np.full((self.num_weapons, self.missiles_per_weapon), -1)  
-        padded_threats = np.zeros((self.max_threats, 4))  # Create a zero matrix
+        self.previous_action = np.full((self.num_weapons, self.missiles_per_weapon), -1)
+        padded_threats = np.zeros((self.max_threats, 4))
         padded_threats[:len(self.threats)] = self.threats
         self.state = np.concatenate((padded_threats.flatten(), self.weapons.flatten()))
-        print(f"🔄 Reset: {self.num_threats} threats initialized.")  
-
+        print(f"🔄 Reset: {len(self.simple_threat_objs)} threats initialized (allocated by random assets).")
         return self.state.astype(np.float32), {}
 
+    def _init_simple_red_team(self, num_threats, speed_range=(1.0, 4.0), max_turn_deg=30.0, seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+        counts, assignments = allocate_targets_by_asset_values(self.weapon_asset_values, num_threats)
+        self.simple_threat_objs = []
+        margin = 5.0
+        for i in range(num_threats):
+            sx = np.random.uniform(margin, self.battlefield_size - margin)
+            sy = np.random.uniform(margin, self.battlefield_size - margin)
+            spd = np.random.uniform(speed_range[0], speed_range[1])
+            target_idx = assignments[i]
+            wx, wy, _ = getattr(self, "weapons", np.array([[self.battlefield_size/2, self.battlefield_size/2, 0]]))[target_idx]
+            init_heading = math.degrees(math.atan2(wy - sy, wx - sx))
+            thr = SimpleThreat(pos=(sx, sy), speed=spd, heading_deg=init_heading,
+                               target_weapon_idx=target_idx, max_turn_deg=max_turn_deg)
+            self.simple_threat_objs.append(thr)
+
+        # Build self.threats array
+        self.threats = np.zeros((len(self.simple_threat_objs), 4))
+        for idx, t in enumerate(self.simple_threat_objs):
+            self.threats[idx, 0:2] = t.pos
+            self.threats[idx, 2] = t.speed
+            self.threats[idx, 3] = t.severity
+
+        self.assignment_duration = {i: 0 for i in range(self.max_threats)}
+        self.weapon_assignment_duration = {}
+        self.previous_weapon_assignment = {}
+
+        # debug prints: counts and per-threat assignment list
+        print(f"Allocated threat counts per weapon (deterministic): {counts}")
+        assignments_by_threat = [t.target_weapon_idx for t in self.simple_threat_objs]
+        print(f"Per-threat assigned targets (threat_idx -> weapon_idx): {assignments_by_threat}")
+
+    def _step_simple_threats_motion(self, dt=1.0, reach_threshold=2.0):
+        for thr in list(self.simple_threat_objs):
+            t_idx = thr.target_weapon_idx
+            if 0 <= t_idx < self.num_weapons:
+                goal_pos = (self.weapons[t_idx, 0], self.weapons[t_idx, 1])
+                thr.step_towards(goal_pos, dt=dt)
+        # sync numpy array
+        self.threats = np.zeros((len(self.simple_threat_objs), 4))
+        for i, t in enumerate(self.simple_threat_objs):
+            self.threats[i, 0:2] = t.pos
+            self.threats[i, 2] = t.speed
+            self.threats[i, 3] = t.severity
+        self.num_threats = len(self.threats)
+
     def evaluate_threats(self):
-        """
-        Evaluates threats based on severity, proximity, and heading toward base.
-        The final danger score is normalized between 0-100.
-        """
         base_x, base_y = self.battlefield_size / 2, self.battlefield_size / 2
         threat_evaluation = []
-
-        for i in range(self.num_threats):
+        for i in range(len(self.threats)):
             threat_x, threat_y, speed, severity = self.threats[i]
-
-            # Distance to base (normalized between 0 and 100, where closer = more dangerous)
             distance = np.linalg.norm([base_x - threat_x, base_y - threat_y])
-            distance_score = max(0, 100 - (distance / self.battlefield_size) * 100)  # Closer threats get higher scores
-
-            # Heading difference (normalized where 0° direct hit is most dangerous)
-            # heading_to_base = np.degrees(np.arctan2(base_y - threat_y, base_x - threat_x))
-            # heading_diff = min(abs(heading_to_base - orientation), 360 - abs(heading_to_base - orientation))
-            # heading_score = max(0, 100 - (heading_diff / 180) * 100)  # Directly heading threats get 100
-
-            # Severity is already between 0.5 and 1, scale to 0-100
-    
-            severity_score = ((severity - 0.5) / 0.5) * 100   
-
-            # Speed contribution (normalize based on a maximum expected speed of 10)
-            speed_score = min(100, (speed / 10) * 100)  # Speed of 10 is considered max danger
-
-            # **Final danger score: Weighted sum of all factors**
-            danger_score = (
-                (severity_score * 0.3) +  # Severity is most important
-                (distance_score * 0.4) +  # Distance to base is crucial
-                #(heading_score * 0.2) +   # Heading toward base adds risk
-                (speed_score * 0.2)       # Faster threats are slightly more dangerous
-            )
-
-            # Ensure the final score is between 0-100
+            distance_score = max(0, 100 - (distance / self.battlefield_size) * 100)
+            severity_score = ((severity - 0.5) / 0.5) * 100
+            speed_score = min(100, (speed / 10) * 100)
+            danger_score = (severity_score * 0.3) + (distance_score * 0.4) + (speed_score * 0.3)
             danger_score = np.clip(danger_score, 0, 100)
-
             threat_evaluation.append((i, danger_score, distance_score, severity_score, speed_score))
-
-        # Sort threats by highest danger first
         threat_evaluation.sort(key=lambda x: x[1], reverse=True)
-
         return threat_evaluation
 
     def step(self, action):
-        """
-        Executes an action, eliminates threats after being assigned to the SAME weapon for 3+ seconds.
-        Includes a stability reward to encourage consistent assignments.
-        """
+        # Print weapon asset values each step for visibility (unchanged during episode)
+        print(f"\n🎯 Weapon asset values (episode): {self.weapon_asset_values.tolist()}")
+
+        # ===  print compact threat evaluation list ===
+        if len(self.threats) > 0:
+            te_list = self.evaluate_threats()  # sorted by danger desc
+            print("\n🔴 Threat Evaluation List (start of step) 🔴")
+            print(f"{'Rank':<5} {'ThreatID':<8} {'Assigned->':<10} {'Danger':<8} {'DistScore':<10} {'Severity':<9} {'Speed':<6}")
+            print("-" * 70)
+            for rank, (tid, danger_score, distance_score, severity_score, speed_score) in enumerate(te_list):
+                assigned = None
+                if tid < len(self.simple_threat_objs):
+                    assigned = self.simple_threat_objs[tid].target_weapon_idx
+                print(f"{rank+1:<5} {tid:<8} {'W'+str(assigned):<10} {danger_score:<8.2f} {distance_score:<10.2f} {severity_score:<9.2f} {speed_score:<6.2f}")
+            print("-" * 70)
+
         print("\n🟡 Raw action input:", action)
         self.steps += 1
         reward = 0
         done = False
-        stability_reward = 0
-            # Get the sorted Threat Evaluation List (Highest danger first)
+
+        # Move threats
+        self._step_simple_threats_motion(dt=1.0)
+
+        # Evaluate & ranking
         threat_evaluation = self.evaluate_threats()
         threat_ranking = {threat[0]: rank for rank, threat in enumerate(threat_evaluation)}
         step_missile_usage = {i: 0 for i in range(self.num_weapons)}
-        valid_threats = np.ones(self.num_threats, dtype=bool)
-        
+        valid_threats = np.ones(len(self.threats), dtype=bool)
 
-        # Convert action into a (num_weapons × missiles_per_weapon) matrix
+        # Convert action to matrix sized by weapons x missiles_per_weapon
         action = np.array(action).reshape(self.num_weapons, self.missiles_per_weapon)
 
-        # Track assigned threats this step
         assigned_this_step = {}
-        threat_assignments = {i: 0 for i in range(self.num_threats)}
+        threat_assignments = {i: 0 for i in range(len(self.threats))}
         self.tracked_assignments = []
 
-        # Initialize tracking if not already done
+        # initialize trackers if missing
         if not hasattr(self, "weapon_assignment_duration"):
-            self.weapon_assignment_duration = {}  # (weapon_idx, threat_idx) → duration
-
+            self.weapon_assignment_duration = {}
         if not hasattr(self, "previous_weapon_assignment"):
-            self.previous_weapon_assignment = {}  # (threat_idx) → previous weapon_idx
+            self.previous_weapon_assignment = {}
 
-        print(f"[DEBUG] Active Threats at Step {self.steps}: {list(range(self.num_threats))}")
-        
-        # **Process missile assignments while respecting `max_assignments_per_threat`**
-        for threat_idx in range(self.num_threats):
-    # If this threat is not yet assigned and is still valid and can be assigned
-            print(valid_threats)
+        print(f"[DEBUG] Active Threats at Step {self.steps}: {list(range(len(self.threats)))}")
+
+        # Process assignments (weapon × missile loops)
+        # We print each successful assignment here for debugging
+        for threat_idx in range(len(self.threats)):
             if threat_idx not in assigned_this_step and valid_threats[threat_idx] and threat_assignments[threat_idx] < self.max_assignments:
                 for weapon_idx in range(self.num_weapons):
                     for missile_idx in range(self.missiles_per_weapon):
-                        if step_missile_usage[weapon_idx] < int(self.weapons[weapon_idx, 2]):  # Check if weapon has missiles left
-                            threat_idx = action[weapon_idx, missile_idx]
-                            if 0 <= threat_idx < self.num_threats:
-                                print(f"Trying: Weapon {weapon_idx}, Missile {missile_idx} → Threat {threat_idx}, Validity: {valid_threats[threat_idx]}")
-                            else:
-                                print(f"🚨 Invalid threat index {threat_idx} (num_threats={self.num_threats}) - skipped.")
-                            if 0 <= threat_idx < self.num_threats and threat_assignments[threat_idx] < self.max_assignments and  valid_threats[threat_idx]:
-                                assigned_this_step[threat_idx] = weapon_idx  # Store current assignment
-                                self.tracked_assignments.append((weapon_idx, threat_idx))
-                                threat_assignments[threat_idx] += 1  # Track assignments
-                                # Decrease missile count for the assigned weapon
+                        if step_missile_usage[weapon_idx] < int(self.weapons[weapon_idx, 2]):
+                            sel_tid = int(action[weapon_idx, missile_idx])
+                            if not (0 <= sel_tid < len(self.threats)):
+                                continue
+                            if threat_assignments[sel_tid] < self.max_assignments and valid_threats[sel_tid]:
+                                assigned_this_step[sel_tid] = weapon_idx
+                                self.tracked_assignments.append((weapon_idx, sel_tid))
+                                threat_assignments[sel_tid] += 1
                                 step_missile_usage[weapon_idx] += 1
-                                if threat_assignments[threat_idx] >= self.max_assignments:
-                                    valid_threats[threat_idx] = False
+                                if threat_assignments[sel_tid] >= self.max_assignments:
+                                    valid_threats[sel_tid] = False
                                 reward += 2
-                                # **Reward Based on Threat Priority**
-                                danger_rank = threat_ranking.get(threat_idx, len(threat_evaluation))  # Get threat rank
+                                danger_rank = threat_ranking.get(sel_tid, len(threat_evaluation))
                                 max_rank = len(threat_evaluation)
-
-                                # Assign higher reward for targeting **high-risk threats** (low rank)
-                                reward += (max_rank - danger_rank) * 5 
-
-                                # **Only increase duration if the same weapon is targeting the same threat**
-                                if threat_idx in self.previous_weapon_assignment and self.previous_weapon_assignment[threat_idx] == weapon_idx:
-                                    self.weapon_assignment_duration[(weapon_idx, threat_idx)] = self.weapon_assignment_duration.get((weapon_idx, threat_idx), 0) + 1
+                                reward += (max_rank - danger_rank) * 5
+                                if sel_tid in self.previous_weapon_assignment and self.previous_weapon_assignment[sel_tid] == weapon_idx:
+                                    self.weapon_assignment_duration[(weapon_idx, sel_tid)] = self.weapon_assignment_duration.get((weapon_idx, sel_tid), 0) + 1
                                 else:
-                                    self.weapon_assignment_duration[(weapon_idx, threat_idx)] = 1  # Reset if new assignment
-                                print(f"Assigning: Weapon {weapon_idx}, Missile {missile_idx} → Threat {threat_idx}")
-        
-        # ✅ **Insert the forced assignment logic here**
-        unassigned_threats = [i for i in range(self.num_threats) if valid_threats[i]]
+                                    self.weapon_assignment_duration[(weapon_idx, sel_tid)] = 1
+
+                                # DEBUG: print this assignment event
+                                print(f"➡️ Assigned (Weapon {weapon_idx}, Missile {missile_idx}) -> Threat {sel_tid}")
+
+        # Forced assignment if some threats left unassigned and missiles available (print those too)
+        unassigned_threats = [i for i in range(len(self.threats)) if valid_threats[i]]
         for threat_idx in unassigned_threats:
+            assigned = False
             for weapon_idx in range(self.num_weapons):
                 if step_missile_usage[weapon_idx] < int(self.weapons[weapon_idx, 2]):
                     assigned_this_step[threat_idx] = weapon_idx
                     self.tracked_assignments.append((weapon_idx, threat_idx))
                     step_missile_usage[weapon_idx] += 1
                     valid_threats[threat_idx] = False
-                    reward -= 5  # Additional reward adjustment here
-                    print(f"🚨 Forced assignment: Weapon {weapon_idx} → Threat {threat_idx}")
-                    break  # Move to next unassigned threat
-                
-        for threat_idx in range(self.num_threats): #check for unassigned threats and give penality according to their rank
+                    reward -= 5
+                    assigned = True
+                    print(f"🚨 Forced assignment: Weapon {weapon_idx} -> Threat {threat_idx}")
+                    break
+            if not assigned:
+                pass
+
+        # After processing, print compact assignment summary
+        if assigned_this_step:
+            print("\n🔸 Assigned this step (threat -> weapon):")
+            for thr, w in sorted(assigned_this_step.items()):
+                print(f"   Threat {thr} -> Weapon {w}")
+            # build reverse mapping
+            by_weapon = {w: [] for w in range(self.num_weapons)}
+            for thr, w in assigned_this_step.items():
+                by_weapon[w].append(thr)
+            print("\n🔸 Assignments by weapon:")
+            for w in range(self.num_weapons):
+                print(f"   Weapon {w} (asset={int(self.weapon_asset_values[w])}): {by_weapon.get(w, [])}")
+        else:
+            print("\n🔸 No assignments this step.")
+
+        # Penalty for not assigning dangerous threats
+        for threat_idx in range(len(self.threats)):
             could_be_assigned = sum(self.weapons[:, 2]) > 0 and threat_assignments[threat_idx] < self.max_assignments
             if threat_idx not in assigned_this_step and threat_idx in threat_ranking and could_be_assigned:
-                low_priority_penalty = (1 - threat_ranking[threat_idx] / len(threat_evaluation)) * -2  # Penalize more for dangerous threats
+                low_priority_penalty = (1 - threat_ranking[threat_idx] / len(threat_evaluation)) * -2
                 reward += low_priority_penalty
-        
-        # ✅ Count unused missiles and unassigned threats
+
+        # Resource utilization check
         total_available_missiles = int(np.sum(self.weapons[:, 2]))
         total_assignments = sum(threat_assignments.values())
         available_threats = sum(1 for t in threat_assignments.values() if t < self.max_assignments)
-
-        if available_threats > 0 and total_assignments < min(self.max_assignments * self.num_threats, total_available_missiles):
+        if available_threats > 0 and total_assignments < min(self.max_assignments * len(self.threats), total_available_missiles):
             print("🚨 Resource under-utilization detected!")
             print(f"    🔸 Available missiles: {total_available_missiles}")
             print(f"    🔸 Threats assignable: {available_threats}")
             print(f"    🔸 Assignments made:  {total_assignments}")
-            reward -= 5  # Optional: penalize for not assigning when able
+            reward -= 5
 
-        # Optional: bonus reward for using missiles effectively
-        if total_assignments == min(self.max_assignments * self.num_threats, total_available_missiles):
-            reward += 5  # Encourage full usage
+        if total_assignments == min(self.max_assignments * len(self.threats), total_available_missiles):
+            reward += 5
 
-        # **Calculate Stability Reward**
+        # Stability reward
         if self.previous_weapon_assignment:
-            stability_reward = sum(
-                1 for threat, weapon in assigned_this_step.items()
-                if self.previous_weapon_assignment.get(threat) == weapon
-            )
-            reward += stability_reward * 2  # Adjust multiplier as needed
+            stability_reward = sum(1 for threat, weapon in assigned_this_step.items() if self.previous_weapon_assignment.get(threat) == weapon)
+            reward += stability_reward * 2
 
-         # ✅ Debug print to check missiles left for each weapon
+        # Debug missile counts
         print("\n🚀 **Missile Count After Assignments** 🚀")
         for weapon_idx in range(self.num_weapons):
             print(f"Weapon {weapon_idx}: {int(self.weapons[weapon_idx, 2])} missiles left")
 
-        # **Apply a Penalty if a Threat Gets Too Close to a Weapon**
-        danger_zone = 10  # Define how close is "too close"
-        close_threat_penalty = -2  # Penalty value
-
-        for threat_idx in range(self.num_threats):
-            threat_x, threat_y, _, _, = self.threats[threat_idx]
-            
+        # Penalty if a threat is too close to a weapon (threats attack weapons)
+        danger_zone = 10
+        close_threat_penalty = -2
+        for threat_idx in range(len(self.threats)):
+            threat_x, threat_y, _, _ = self.threats[threat_idx]
             for weapon_idx in range(self.num_weapons):
                 weapon_x, weapon_y, _ = self.weapons[weapon_idx]
-                
-                # Calculate distance between the threat and the weapon
                 distance = np.linalg.norm([threat_x - weapon_x, threat_y - weapon_y])
-                
-                if distance < danger_zone:  # If the threat is too close, apply a penalty
+                if distance < danger_zone:
                     reward += close_threat_penalty
                     print(f"⚠️ Penalty! Threat {threat_idx} is too close to Weapon {weapon_idx} (Dist: {distance:.2f})")
 
-        # **Update assignment durations (Only for the same weapon-threat pair)**
-        for threat_idx in range(self.num_threats):
-            if threat_idx in assigned_this_step:  # If threat is assigned
+        # Update assignment durations
+        for threat_idx in range(len(self.threats)):
+            if threat_idx in assigned_this_step:
                 current_weapon = assigned_this_step[threat_idx]
                 if (current_weapon, threat_idx) in self.weapon_assignment_duration:
                     self.assignment_duration[threat_idx] = self.weapon_assignment_duration[(current_weapon, threat_idx)]
             else:
-                self.assignment_duration[threat_idx] = 0  # Reset if no assignment
+                self.assignment_duration[threat_idx] = 0
 
-        # **Store previous assignments for next step comparison**
+        # store previous assignment
         self.previous_weapon_assignment = assigned_this_step.copy()
 
-        # **Eliminate threats assigned for 7+ seconds**
+        # Remove threats assigned for >= 3 steps
         threats_to_remove = [tid for tid, duration in self.assignment_duration.items() if duration >= 3]
-
         if threats_to_remove:
-            threats_to_remove = [tid for tid in threats_to_remove if tid < len(self.threats)]  # Ensure valid indices
+            threats_to_remove = [tid for tid in threats_to_remove if tid < len(self.threats)]
             for tid in threats_to_remove:
                 for threat_info in threat_evaluation:
                     if threat_info[0] == tid:
                         danger_score = threat_info[1]
-                        reward += danger_score * 0.5  # Adjust multiplier as needed
+                        reward += danger_score * 0.5
                         break
-            self.threats = np.delete(self.threats, threats_to_remove, axis=0)  # Remove threats
+            # remove from simple_threat_objs (descending indices to pop safely)
+            for tid in sorted(threats_to_remove, reverse=True):
+                if tid < len(self.simple_threat_objs):
+                    print(f"🗑️ Removing threat {tid} (assigned long enough).")
+                    del self.simple_threat_objs[tid]
+            # update numpy threats array
+            self.threats = np.delete(self.threats, threats_to_remove, axis=0) if len(self.threats) > 0 else np.zeros((0, 4))
             self.num_threats = len(self.threats)
+            # Reduce missile stock for weapons that were involved
             for weapon_idx, threat_idx in self.tracked_assignments:
                 if threat_idx in threats_to_remove:
                     self.weapons[weapon_idx, 2] = max(0, self.weapons[weapon_idx, 2] - 1)
-            
+            # Filter out assignment durations for removed threats
+            self.weapon_assignment_duration = {(w, t): d for (w, t), d in self.weapon_assignment_duration.items() if t not in threats_to_remove}
 
-            # Remove eliminated threats from tracking
-            self.weapon_assignment_duration = {
-                (w, t): d for (w, t), d in self.weapon_assignment_duration.items() if t not in threats_to_remove
-            }
-
-        # **Threats continue moving**
-        for i in range(self.num_threats):
-            angle_rad = np.radians(self.threats[i, 3])  
-            self.threats[i, 0] += self.threats[i, 2] * np.cos(angle_rad)  
-            self.threats[i, 1] += self.threats[i, 2] * np.sin(angle_rad)  
-            self.threats[i, 0] = np.clip(self.threats[i, 0], 0, self.battlefield_size)
-            self.threats[i, 1] = np.clip(self.threats[i, 1], 0, self.battlefield_size)
-
-        # **Check if all threats are eliminated**
-        if self.num_threats == 0:
-            reward += 2500 / self.steps
+        # Check termination conditions
+        if len(self.threats) == 0:
+            reward += 2500 / max(1, self.steps)
             print("All threats are killed")
-            done = True 
+            done = True
 
         total_missiles_left = np.sum(self.weapons[:, 2])
-        if total_missiles_left <= 0 and done != True:
+        if total_missiles_left <= 0 and not done:
             print("❌ All weapons are out of missiles!")
             reward += 3
             done = True
@@ -307,20 +393,20 @@ class TEWAEnv(gym.Env):
             reward -= 10
             done = True
 
-        # **Fix Observation Shape (Padding to Keep it Constant)**
-        padded_threats = np.zeros((self.max_threats, 4))  # Create a zero matrix of max size
-        padded_threats[:len(self.threats)] = self.threats  # Fill existing threats
-        
-        self.state = np.concatenate((padded_threats.flatten(), self.weapons.flatten())) 
+        # Build padded state
+        padded_threats = np.zeros((self.max_threats, 4))
+        if len(self.threats) > 0:
+            padded_threats[:len(self.threats)] = self.threats
+        self.state = np.concatenate((padded_threats.flatten(), self.weapons.flatten()))
 
-        # **Print debug information**)
-        # Filter out removed threats from the weapon_assignment_duration dictionary
+        # Cleanup weapon_assignment_duration entries referencing out-of-range threats
         self.weapon_assignment_duration = {
             (weapon, threat): duration
             for (weapon, threat), duration in self.weapon_assignment_duration.items()
             if threat < len(self.threats)
         }
-         # Print the **Assignment Durations for Assigned Pairs**
+
+        # Print assignment durations for debugging
         print(f"\n[Step {self.steps}]\n⏳ **Assignment Durations for Assigned Pairs** ⏳")
         for weapon_idx, threat_idx in self.tracked_assignments:
             if (weapon_idx, threat_idx) in self.weapon_assignment_duration:
@@ -328,79 +414,43 @@ class TEWAEnv(gym.Env):
                 print(f"Weapon {weapon_idx} → Threat {threat_idx}: {duration} steps")
 
         print("reward:", reward)
-
-        
         return self.state.astype(np.float32), reward, done, False, {}
 
-
-    def render(self, action):
-        """
-        Visualizes the battlefield, showing threats, weapons, assignment lines, and threat movement vectors.
-        """
-        print(f"📡 Rendering: {self.num_threats} threats, {len(self.tracked_assignments)} assignments")
+    def render(self, action=None):
         plt.clf()
         plt.xlim(0, self.battlefield_size)
         plt.ylim(0, self.battlefield_size)
         plt.grid(True)
 
-        # Plot threats with movement vectors (arrows)
-        for i in range(self.num_threats):
-            plt.scatter(self.threats[i, 0], self.threats[i, 1], color='red', s=100)
-            plt.text(self.threats[i, 0] + 2, self.threats[i, 1] + 2, f"T{i}", fontsize=10, color='black')
-
-            # Draw movement direction
-            # plt.arrow(self.threats[i, 0], self.threats[i, 1], 
-            #           np.cos(np.radians(self.threats[i, 3])) * 5, 
-            #           np.sin(np.radians(self.threats[i, 3])) * 5, head_width=2, fc='black')
-
-        # Plot weapons at **separate locations**
+        cmap = plt.get_cmap('tab10')  # up to 10 different colors
+        # plot weapons with asset labels
         for i in range(self.num_weapons):
-            plt.scatter(self.weapons[i, 0], self.weapons[i, 1], color='green', s=150)
-            plt.text(self.weapons[i, 0] + 2, self.weapons[i, 1] + 2, f"W{i}", fontsize=10, color='black')
+            plt.scatter(self.weapons[i, 0], self.weapons[i, 1], color='green', s=150, zorder=5)
+            asset_val = int(self.weapon_asset_values[i]) if hasattr(self, "weapon_asset_values") else None
+            plt.text(self.weapons[i, 0] + 2, self.weapons[i, 1] + 2, f"W{i} (A:{asset_val})", fontsize=10, color='black', zorder=6)
 
-        # Draw missile assignment lines
-        action = np.array(action).reshape(self.num_weapons, -1)
-        for weapon_idx, threat_idx in self.tracked_assignments:
-             if 0 <= threat_idx < len(self.threats):
-                plt.plot([self.weapons[weapon_idx, 0], self.threats[threat_idx, 0]],
-                        [self.weapons[weapon_idx, 1], self.threats[threat_idx, 1]], 'k--', linewidth=1)
-       
+        # plot threat paths and current positions
+        for i, t in enumerate(self.simple_threat_objs):
+            color = cmap(t.target_weapon_idx % 10)
+            # path line
+            xs = [p[0] for p in t.path]
+            ys = [p[1] for p in t.path]
+            plt.plot(xs, ys, linestyle='-', linewidth=1.5, color=color, alpha=0.8)
+            # start marker
+            plt.scatter(xs[0], ys[0], marker='o', s=40, color=color, edgecolor='black', zorder=7)
+            # current position marker
+            plt.scatter(t.pos[0], t.pos[1], marker='>', s=80, color=color, edgecolor='black', zorder=8)
+            plt.text(t.pos[0] + 1, t.pos[1] + 1, f"T{i}->W{t.target_weapon_idx}", fontsize=9, color='black')
 
-        plt.title(f"Battlefield at Step {self.steps}")
-        plt.pause(1.5)
-        # Print the assignment pairs for each step
-        print("\n🔗 **Assignment Pairs (Weapon → Threat)** 🔗")
-        for weapon_idx, threat_idx in self.tracked_assignments:
-            print(f"Threat {threat_idx} → Weapon {weapon_idx} ")
+        # draw assignment lines for debugging
+        if hasattr(self, "tracked_assignments") and self.tracked_assignments:
+            for weapon_idx, threat_idx in self.tracked_assignments:
+                if 0 <= threat_idx < len(self.threats):
+                    plt.plot([self.weapons[weapon_idx, 0], self.threats[threat_idx, 0]],
+                             [self.weapons[weapon_idx, 1], self.threats[threat_idx, 1]], 'k--', linewidth=1)
 
-    
+        plt.title(f"Battlefield at Step {getattr(self, 'steps', 0)}")
+        plt.pause(0.5)
 
-         # Print the **Threat Evaluation List**
-        print("\n🔴 **Threat Evaluation List (Most Dangerous First)** 🔴")
-        print(f"{'Rank':<5} {'Threat ID':<10} {'Danger Score':<15} {'Distance':<10} {'Severity':<10} {'Speed':<5}")
-        print("-" * 80)
-        for rank, (tid, danger_score, distance_score, severity_score, speed_score) in enumerate(self.evaluate_threats()):
-            print(f"{rank+1:<5} {tid:<10} {danger_score:<15.2f} {distance_score:<10.2f}  {severity_score:<10.2f} {speed_score:<5.2f}")
 
-# # Run the Simulation
-# if __name__ == "__main__":
-#     plt.ion()
-#     env = TEWAEnv(num_threats=5, num_weapons=2, battlefield_size=150, missiles_per_weapon=2, max_assignments=1)
-#     state, _ = env.reset()
-#     done = False
 
-#     for _ in range(50):  
-#         action = env.action_space.sample()  
-#         state, reward, done, _, _ = env.step(action)
-        
-#         # Check for weapons out of missiles and print a warning
-#         for i, weapon in enumerate(env.weapons):
-#             if weapon[2] <= 0:  # Check missile count
-#                 print(f"⚠️ Warning: Weapon {i} is out of missiles!")
-
-#         env.render(action)
-#         if done:
-#             print("\n🎉 All threats have been eliminated! Simulation complete.")
-#             break
-#     plt.ioff()
-#     plt.show()
